@@ -92,3 +92,8 @@ Then search for `KithWave` in Windows Start and launch it.
 - Spotify audio is not streamed directly. Spotify metadata is resolved into playable sources.
 - If audio fails, check that `ffmpeg` is installed and on `PATH`.
 - Large playlist imports are capped by `PLAYLIST_ITEM_CAP` for responsiveness.
+
+## Roadmap
+- [ ] Add slash-command versions of the core controls
+- [ ] Add small tests around query parsing and URL handling
+- [ ] Improve reconnect behavior after voice disconnects
