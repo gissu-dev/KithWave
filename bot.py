@@ -37,6 +37,8 @@ except ValueError:
     PLAYLIST_ITEM_CAP = 50
 PLAYLIST_ITEM_CAP = max(1, min(500, PLAYLIST_ITEM_CAP))
 LYRICS_CHAR_LIMIT = 3500
+VOICE_STATUS_PREFIX = "Now playing: "
+VOICE_STATUS_MAX_LEN = 500
 
 YTDL_OPTIONS = {
     "format": "bestaudio/best",
@@ -91,7 +93,7 @@ class GuildMusicState:
         self.current: Optional[Track] = None
         self.channel_id: Optional[int] = None
         self.control_message_id: Optional[int] = None
-        self.volume: float = 0.7
+        self.volume: float = 0.01
         self.lock = asyncio.Lock()
 
 
@@ -240,6 +242,69 @@ class MusicCog(commands.Cog):
             self.states[guild_id] = GuildMusicState()
         return self.states[guild_id]
 
+    def _status_artist_title(self, track: Track) -> tuple[str, str]:
+        for artist, title in self._lyrics_artist_title_candidates(track):
+            artist_name = artist.strip() if isinstance(artist, str) else ""
+            cleaned_title = self._clean_lyrics_query(title)
+            if artist_name and cleaned_title:
+                return artist_name, cleaned_title
+
+        cleaned_title = self._clean_lyrics_query(track.title) or track.title.strip()
+        if not cleaned_title:
+            cleaned_title = "Unknown Track"
+        return "Unknown Artist", cleaned_title
+
+    def _build_voice_channel_status(self, track: Track) -> str:
+        artist, title = self._status_artist_title(track)
+        status_body = f"{title} - {artist}"
+        max_body_len = max(4, VOICE_STATUS_MAX_LEN - len(VOICE_STATUS_PREFIX))
+        if len(status_body) > max_body_len:
+            status_body = status_body[: max_body_len - 3].rstrip() + "..."
+        return f"{VOICE_STATUS_PREFIX}{status_body}"
+
+    async def sync_voice_channel_status(self, guild: discord.Guild) -> None:
+        state = self.get_state(guild.id)
+        track = state.current
+        voice_client = guild.voice_client
+        if not track or not voice_client:
+            return
+
+        channel = voice_client.channel
+        if not isinstance(channel, discord.VoiceChannel):
+            return
+
+        me = guild.me
+        if not me:
+            return
+        perms = channel.permissions_for(me)
+        can_set_status = perms.manage_channels or getattr(perms, "set_voice_channel_status", False)
+        if not can_set_status:
+            return
+
+        current_status = ""
+        try:
+            payload = await self.bot.http.get_channel(channel.id)
+            raw_status = payload.get("status")
+            if isinstance(raw_status, str):
+                current_status = raw_status.strip()
+        except discord.HTTPException as e:
+            log.debug("Failed to fetch voice channel status for guild %s: %s", guild.id, e)
+            return
+
+        if current_status and not current_status.lower().startswith(VOICE_STATUS_PREFIX.lower()):
+            return
+
+        desired_status = self._build_voice_channel_status(track)
+        if current_status == desired_status:
+            return
+
+        try:
+            await channel.edit(status=desired_status, reason="KithWave now playing status")
+        except discord.Forbidden:
+            pass
+        except discord.HTTPException as e:
+            log.warning("Failed to update voice channel status for guild %s: %s", guild.id, e)
+
     async def extract_track(self, query: str, requester: str) -> Track:
         loop = asyncio.get_running_loop()
         info = await loop.run_in_executor(None, lambda: ytdl.extract_info(query, download=False))
@@ -271,6 +336,8 @@ class MusicCog(commands.Cog):
         if voice_client:
             return voice_client
 
+        state = self.get_state(guild.id)
+        state.volume = 0.01
         return await target_channel.connect()
 
     def _spotify_kind_and_id(self, query: str) -> Optional[tuple[str, str]]:
@@ -1274,8 +1341,9 @@ class MusicCog(commands.Cog):
             voice_client.play(source, after=after_play)
 
         await self.send_now_playing_embed(guild)
+        await self.sync_voice_channel_status(guild)
 
-    async def upsert_control_panel(self, guild: discord.Guild) -> None:
+    async def upsert_control_panel(self, guild: discord.Guild, *, force_new_message: bool = False) -> None:
         state = self.get_state(guild.id)
         if not state.channel_id:
             return
@@ -1285,6 +1353,15 @@ class MusicCog(commands.Cog):
 
         embed = self.build_now_playing_embed(guild)
         view = MusicControlView(self, guild.id)
+
+        if force_new_message and state.control_message_id and hasattr(channel, "fetch_message"):
+            try:
+                old_message = await channel.fetch_message(state.control_message_id)
+                await old_message.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+            finally:
+                state.control_message_id = None
 
         if state.control_message_id and hasattr(channel, "fetch_message"):
             try:
@@ -1327,7 +1404,7 @@ class MusicCog(commands.Cog):
             state.control_message_id = None
 
     async def send_now_playing_embed(self, guild: discord.Guild) -> None:
-        await self.upsert_control_panel(guild)
+        await self.upsert_control_panel(guild, force_new_message=True)
 
     async def refresh_now_playing_embed(self, guild: Optional[discord.Guild]) -> None:
         if not guild:
