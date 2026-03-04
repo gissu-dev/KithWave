@@ -1,0 +1,5 @@
+discord.py[voice]>=2.4.0,<3
+PyNaCl>=1.5.0,<2
+python-dotenv>=1.0.0,<2
+spotipy>=2.25.0,<3
+yt-dlp
