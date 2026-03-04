@@ -4,6 +4,7 @@ KithWave is a Discord music bot I built for my own server. It uses prefix comman
 
 ## Features
 - Play music from YouTube search or URL
+- Play live radio by station name or stream URL
 - Import tracks from Spotify track/album/playlist links
 - Import YouTube playlists
 - Shuffle on import with `--shuffle`
@@ -58,6 +59,7 @@ python bot.py
 
 - `<prefix>play <query_or_url>`
 - `<prefix>play --shuffle <playlist_url>`
+- `<prefix>radio <station_name_or_stream_url>`
 - `<prefix>queue`
 - `<prefix>shuffle`
 - `<prefix>nowplaying`
@@ -90,6 +92,7 @@ Then search for `KithWave` in Windows Start and launch it.
 
 ## Notes
 - Spotify audio is not streamed directly. Spotify metadata is resolved into playable sources.
+- Radio station name lookup uses Radio Browser and queues the top matching station stream.
 - If audio fails, check that `ffmpeg` is installed and on `PATH`.
 - Large playlist imports are capped by `PLAYLIST_ITEM_CAP` for responsiveness.
 

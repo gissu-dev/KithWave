@@ -39,6 +39,8 @@ PLAYLIST_ITEM_CAP = max(1, min(500, PLAYLIST_ITEM_CAP))
 LYRICS_CHAR_LIMIT = 3500
 VOICE_STATUS_PREFIX = "Now playing: "
 VOICE_STATUS_MAX_LEN = 500
+RADIO_BROWSER_SEARCH_URL = "https://de1.api.radio-browser.info/json/stations/search"
+RADIO_SEARCH_LIMIT = 5
 
 YTDL_OPTIONS = {
     "format": "bestaudio/best",
@@ -93,7 +95,7 @@ class GuildMusicState:
         self.current: Optional[Track] = None
         self.channel_id: Optional[int] = None
         self.control_message_id: Optional[int] = None
-        self.volume: float = 0.01
+        self.volume: float = 0.03
         self.lock = asyncio.Lock()
 
 
@@ -305,6 +307,49 @@ class MusicCog(commands.Cog):
         except discord.HTTPException as e:
             log.warning("Failed to update voice channel status for guild %s: %s", guild.id, e)
 
+    async def clear_voice_channel_status(
+        self,
+        guild: discord.Guild,
+        channel: Optional[discord.abc.GuildChannel] = None,
+    ) -> None:
+        target_channel = channel
+        if target_channel is None:
+            voice_client = guild.voice_client
+            if not voice_client:
+                return
+            target_channel = voice_client.channel
+
+        if not isinstance(target_channel, discord.VoiceChannel):
+            return
+
+        me = guild.me
+        if not me:
+            return
+        perms = target_channel.permissions_for(me)
+        can_set_status = perms.manage_channels or getattr(perms, "set_voice_channel_status", False)
+        if not can_set_status:
+            return
+
+        current_status = ""
+        try:
+            payload = await self.bot.http.get_channel(target_channel.id)
+            raw_status = payload.get("status")
+            if isinstance(raw_status, str):
+                current_status = raw_status.strip()
+        except discord.HTTPException as e:
+            log.debug("Failed to fetch voice channel status for guild %s: %s", guild.id, e)
+            return
+
+        if not current_status or not current_status.lower().startswith(VOICE_STATUS_PREFIX.lower()):
+            return
+
+        try:
+            await target_channel.edit(status=None, reason="KithWave status cleared on disconnect")
+        except discord.Forbidden:
+            pass
+        except discord.HTTPException as e:
+            log.warning("Failed to clear voice channel status for guild %s: %s", guild.id, e)
+
     async def extract_track(self, query: str, requester: str) -> Track:
         loop = asyncio.get_running_loop()
         info = await loop.run_in_executor(None, lambda: ytdl.extract_info(query, download=False))
@@ -337,7 +382,7 @@ class MusicCog(commands.Cog):
             return voice_client
 
         state = self.get_state(guild.id)
-        state.volume = 0.01
+        state.volume = 0.03
         return await target_channel.connect()
 
     def _spotify_kind_and_id(self, query: str) -> Optional[tuple[str, str]]:
@@ -1121,6 +1166,109 @@ class MusicCog(commands.Cog):
     def _is_youtube_playlist_url(self, query: str) -> bool:
         return bool(YOUTUBE_PLAYLIST_URL_RE.search(query))
 
+    def _is_http_url(self, value: str) -> bool:
+        lowered = value.strip().lower()
+        return lowered.startswith("http://") or lowered.startswith("https://")
+
+    def _radio_search_sync(self, station_query: str, limit: int = RADIO_SEARCH_LIMIT) -> list[dict]:
+        cleaned_query = station_query.strip()
+        if not cleaned_query:
+            return []
+
+        limit_val = max(1, min(10, limit))
+        query_url = (
+            f"{RADIO_BROWSER_SEARCH_URL}?name={quote(cleaned_query, safe='')}"
+            f"&limit={limit_val}&hidebroken=true&order=votes&reverse=true"
+        )
+
+        payload = self._http_get_json_sync(query_url)
+        if not isinstance(payload, list):
+            return []
+
+        stations: list[dict] = []
+        for entry in payload:
+            if not isinstance(entry, dict):
+                continue
+
+            name = str(entry.get("name") or "").strip()
+            stream_url = str(entry.get("url_resolved") or entry.get("url") or "").strip()
+            homepage = str(entry.get("homepage") or "").strip()
+            country = str(entry.get("country") or "").strip()
+            state = str(entry.get("state") or "").strip()
+
+            if not name or not stream_url or not self._is_http_url(stream_url):
+                continue
+            if entry.get("lastcheckok") in (0, "0", False):
+                continue
+
+            stations.append(
+                {
+                    "name": name,
+                    "stream_url": stream_url,
+                    "homepage": homepage,
+                    "country": country,
+                    "state": state,
+                }
+            )
+            if len(stations) >= limit_val:
+                break
+
+        return stations
+
+    async def resolve_radio_track(self, station_or_url: str, requester: str) -> tuple[Track, Optional[str]]:
+        cleaned_query = station_or_url.strip()
+        if not cleaned_query:
+            raise RuntimeError(f"Usage: `{self.prefix}radio <station name or stream URL>`")
+
+        if self._is_http_url(cleaned_query):
+            fallback_track = Track(
+                title=cleaned_query,
+                stream_url=cleaned_query,
+                webpage_url=cleaned_query,
+                duration=None,
+                thumbnail=None,
+                requested_by=requester,
+                source_query=cleaned_query,
+            )
+            try:
+                extracted_track = await self.extract_track(cleaned_query, requester)
+                return extracted_track, "Direct stream URL."
+            except Exception as e:
+                log.warning("Radio URL extraction failed for '%s': %s", cleaned_query, e)
+                return fallback_track, "Direct stream URL."
+
+        loop = asyncio.get_running_loop()
+        stations = await loop.run_in_executor(None, lambda: self._radio_search_sync(cleaned_query))
+        if not stations:
+            raise RuntimeError(
+                "No radio stations matched that name. Try a more specific name or pass a direct stream URL."
+            )
+
+        selected = stations[0]
+        station_name = str(selected.get("name") or "Radio Stream")
+        stream_url = str(selected.get("stream_url") or "").strip()
+        if not stream_url:
+            raise RuntimeError("The matched station did not include a playable stream URL.")
+
+        webpage_url = str(selected.get("homepage") or "").strip() or stream_url
+        track = Track(
+            title=station_name,
+            stream_url=stream_url,
+            webpage_url=webpage_url,
+            duration=None,
+            thumbnail=None,
+            requested_by=requester,
+            source_query=cleaned_query,
+        )
+
+        location_bits = [bit for bit in [selected.get("state"), selected.get("country")] if isinstance(bit, str) and bit]
+        source_note = f"Matched `{station_name}`"
+        if location_bits:
+            source_note += f" ({', '.join(location_bits)})."
+        else:
+            source_note += "."
+        return track, source_note
+
     def spotify_error_status(self, exc: Exception) -> Optional[int]:
         status = getattr(exc, "http_status", None)
         if isinstance(status, int):
@@ -1324,6 +1472,7 @@ class MusicCog(commands.Cog):
             if not state.queue:
                 state.current = None
                 if voice_client.is_connected():
+                    await self.clear_voice_channel_status(guild)
                     await voice_client.disconnect()
                 await self.delete_control_panel(guild)
                 return
@@ -1426,7 +1575,11 @@ class MusicCog(commands.Cog):
             if state.current.thumbnail:
                 embed.set_thumbnail(url=state.current.thumbnail)
         else:
-            embed.add_field(name="Now Playing", value=f"Silence in the crypt. Use `{self.prefix}play` to begin.", inline=False)
+            embed.add_field(
+                name="Now Playing",
+                value=f"Silence in the crypt. Use `{self.prefix}play` or `{self.prefix}radio` to begin.",
+                inline=False,
+            )
 
         status = "Paused" if guild.voice_client and guild.voice_client.is_paused() else "Playing"
         if not guild.voice_client or not guild.voice_client.is_playing():
@@ -1491,6 +1644,7 @@ class MusicCog(commands.Cog):
         if vc:
             if vc.is_playing() or vc.is_paused():
                 vc.stop()
+            await self.clear_voice_channel_status(guild)
             await vc.disconnect()
         await self.delete_control_panel(guild)
         return True, "Stopped playback, cleared queue, and disconnected."
@@ -1605,6 +1759,41 @@ class MusicCog(commands.Cog):
             source_bits.append("Shuffled playlist order.")
         if source_bits:
             embed.add_field(name="Source", value=" ".join(source_bits), inline=False)
+        embed.set_footer(text="KithWave")
+        await ctx.send(embed=embed)
+
+        if not voice_client.is_playing() and not voice_client.is_paused():
+            await self.play_next(ctx.guild)
+
+    @commands.command(name="radio")
+    async def radio_cmd(self, ctx: commands.Context, *, station_or_url: str) -> None:
+        if not ctx.guild or not isinstance(ctx.author, discord.Member):
+            await ctx.send("This command works in a server only.")
+            return
+
+        try:
+            voice_client = await self.ensure_voice(ctx.guild, ctx.author)
+        except RuntimeError as e:
+            await ctx.send(str(e))
+            return
+
+        state = self.get_state(ctx.guild.id)
+        state.channel_id = ctx.channel.id
+
+        async with ctx.typing():
+            try:
+                track, source_note = await self.resolve_radio_track(station_or_url, ctx.author.mention)
+            except RuntimeError as e:
+                await ctx.send(str(e))
+                return
+
+        state.queue.append(track)
+
+        embed = discord.Embed(color=self.embed_color, title="Added Radio Stream")
+        embed.description = f"[{track.title}]({track.webpage_url})"
+        embed.add_field(name="Length", value="`Live`", inline=True)
+        if source_note:
+            embed.add_field(name="Source", value=source_note, inline=False)
         embed.set_footer(text="KithWave")
         await ctx.send(embed=embed)
 
@@ -1773,6 +1962,7 @@ class MusicCog(commands.Cog):
         if not self.bot.user or member.id != self.bot.user.id:
             return
         if before.channel and after.channel is None:
+            await self.clear_voice_channel_status(member.guild, before.channel)
             await self.delete_control_panel(member.guild)
 
 
