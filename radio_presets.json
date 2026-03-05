@@ -1,0 +1,172 @@
+[
+  {
+    "id": "capitalglasgow",
+    "name": "Capital Glasgow",
+    "stream_url": "https://media-ssl.musicradio.com/CapitalUK",
+    "stream_urls": [
+      "https://media-ssl.musicradio.com/Capital",
+      "http://media-ice.musicradio.com/CapitalMP3",
+      "http://icecast.thisisdax.com/Capital"
+    ],
+    "query": "capital fm glasgow",
+    "homepage": "https://www.capitalfm.com/glasgow/",
+    "description": "Capital Scotland (Glasgow) pop hits.",
+    "aliases": [
+      "capital",
+      "capital fm",
+      "capital glasgow",
+      "capital scotland"
+    ]
+  },
+  {
+    "id": "heartfmuk",
+    "name": "Heart FM UK",
+    "stream_url": "https://media-ssl.musicradio.com/HeartUK",
+    "query": "heart fm uk",
+    "homepage": "https://www.heart.co.uk/",
+    "description": "UK pop hits and mainstream chart radio.",
+    "aliases": [
+      "heart fm",
+      "heart uk",
+      "heart london",
+      "heart pop"
+    ]
+  },
+  {
+    "id": "heartdanceuk",
+    "name": "Heart Dance UK",
+    "stream_url": "https://media-ssl.musicradio.com/HeartDance",
+    "stream_urls": [
+      "http://media-ice.musicradio.com/HeartDanceMP3"
+    ],
+    "query": "heart dance uk",
+    "homepage": "https://www.heart.co.uk/radio/shows-presenters/heart-dance/",
+    "description": "Heart Dance UK station preset.",
+    "aliases": [
+      "heart dance",
+      "heartdance",
+      "heart dance uk",
+      "heart fm dance"
+    ]
+  },
+  {
+    "id": "froggy101",
+    "name": "Froggy 101",
+    "query": "froggy 101",
+    "description": "Country station preset (lookup by name).",
+    "aliases": [
+      "froggy",
+      "froggy 101"
+    ]
+  },
+  {
+    "id": "groovesalad",
+    "name": "SomaFM Groove Salad",
+    "stream_url": "https://ice2.somafm.com/groovesalad-128-mp3",
+    "homepage": "https://somafm.com/groovesalad/",
+    "description": "Ambient and chilled electronic.",
+    "aliases": [
+      "groove salad",
+      "somafm"
+    ]
+  },
+  {
+    "id": "dronezone",
+    "name": "SomaFM Drone Zone",
+    "stream_url": "https://ice2.somafm.com/dronezone-128-mp3",
+    "homepage": "https://somafm.com/dronezone/",
+    "description": "Deep ambient and drone soundscapes.",
+    "aliases": [
+      "drone zone",
+      "ambient"
+    ]
+  },
+  {
+    "id": "kexp",
+    "name": "KEXP 90.3",
+    "stream_url": "https://kexp.streamguys1.com/kexp160.aac",
+    "homepage": "https://www.kexp.org/",
+    "description": "Independent and alternative radio.",
+    "aliases": [
+      "kexp",
+      "kexp 90.3"
+    ]
+  },
+  {
+    "id": "nightride",
+    "name": "Nightride FM",
+    "stream_url": "https://radio.nightride.fm/nightride.m4a",
+    "homepage": "https://nightride.fm/",
+    "description": "Synthwave and retrowave station.",
+    "aliases": [
+      "nightride",
+      "synthwave"
+    ]
+  },
+  {
+    "id": "clyde1",
+    "name": "Clyde 1",
+    "stream_url": "https://edge-bauerall-01-gos2.sharp-stream.com/clyde1.mp3",
+    "stream_urls": [
+      "https://edge-bauerall-01-gos2.sharp-stream.com/clyde1.aac",
+      "https://stream-al.planetradio.co.uk/clyde1.aac",
+      "http://stream-al.planetradio.co.uk/clyde1.aac"
+    ],
+    "query": "clyde 1 glasgow",
+    "homepage": "https://hellorayo.co.uk/clyde/",
+    "description": "Scottish pop/hits station (Glasgow).",
+    "aliases": [
+      "clyde1",
+      "clyde 1",
+      "radio clyde",
+      "clyde one"
+    ]
+  },
+  {
+    "id": "star1021tx",
+    "name": "STAR 102.1 (Texas)",
+    "stream_url": "https://playerservices.streamtheworld.com/api/livestream-redirect/KODMFMAACIHR.aac",
+    "stream_urls": [
+      "https://playerservices.streamtheworld.com/api/livestream-redirect/KODMFMAAC.aac",
+      "https://playerservices.streamtheworld.com/api/livestream-redirect/KODMFM.mp3",
+      "http://playerservices.streamtheworld.com/api/livestream-redirect/KODMFMAACIHR.aac"
+    ],
+    "query": "star 102.1 texas",
+    "homepage": "https://star1021.iheart.com/",
+    "description": "Texas iHeart pop station preset.",
+    "aliases": [
+      "star 102.1",
+      "star1021",
+      "star texas",
+      "iheart star 1021"
+    ]
+  },
+  {
+  "id": "punkrockersradio",
+  "name": "Punkrockers-Radio",
+  "stream_url": "http://stream.punkrockers-radio.de:8443",
+  "query": "punkrockers radio",
+  "homepage": "https://punkrockers-radio.de/",
+  "description": "Underground punk-focused web radio.",
+  "aliases": ["punkrockers", "punkrockers radio"]
+  },
+  {
+    "id": "swr3",
+    "name": "SWR3 (Germany)",
+    "stream_url": "https://liveradio.swr.de/sw282p3/swr3/play.mp3",
+    "stream_urls": [
+      "http://liveradio.swr.de/sw282p3/swr3/play.mp3",
+      "https://swr-swr3-live.cast.addradio.de/swr/swr3/live/mp3/128/stream.mp3",
+      "http://swr-swr3-live.cast.addradio.de/swr/swr3/live/mp3/128/stream.mp3"
+    ],
+    "query": "swr3 germany",
+    "homepage": "https://www.swr3.de/",
+    "description": "SWR3 pop radio from Germany.",
+    "aliases": [
+      "swr3",
+      "swr 3",
+      "swr3 germany",
+      "german swr3"
+    ]
+  }
+]

@@ -41,6 +41,48 @@ VOICE_STATUS_PREFIX = "Now playing: "
 VOICE_STATUS_MAX_LEN = 500
 RADIO_BROWSER_SEARCH_URL = "https://de1.api.radio-browser.info/json/stations/search"
 RADIO_SEARCH_LIMIT = 5
+RADIO_PRESETS_FILE = "radio_presets.json"
+DEFAULT_RADIO_PRESETS = [
+    {
+        "id": "froggy101",
+        "name": "Froggy 101",
+        "query": "froggy 101",
+        "description": "Country station preset (lookup by name).",
+        "aliases": ["froggy", "froggy 101"],
+    },
+    {
+        "id": "groovesalad",
+        "name": "SomaFM Groove Salad",
+        "stream_url": "https://ice2.somafm.com/groovesalad-128-mp3",
+        "homepage": "https://somafm.com/groovesalad/",
+        "description": "Ambient and chilled electronic.",
+        "aliases": ["groove salad", "somafm"],
+    },
+    {
+        "id": "dronezone",
+        "name": "SomaFM Drone Zone",
+        "stream_url": "https://ice2.somafm.com/dronezone-128-mp3",
+        "homepage": "https://somafm.com/dronezone/",
+        "description": "Deep ambient and drone soundscapes.",
+        "aliases": ["drone zone", "ambient"],
+    },
+    {
+        "id": "kexp",
+        "name": "KEXP 90.3",
+        "stream_url": "https://kexp.streamguys1.com/kexp160.aac",
+        "homepage": "https://www.kexp.org/",
+        "description": "Independent and alternative radio.",
+        "aliases": ["kexp", "kexp 90.3"],
+    },
+    {
+        "id": "nightride",
+        "name": "Nightride FM",
+        "stream_url": "https://radio.nightride.fm/nightride.m4a",
+        "homepage": "https://nightride.fm/",
+        "description": "Synthwave and retrowave station.",
+        "aliases": ["nightride", "synthwave"],
+    },
+]
 
 YTDL_OPTIONS = {
     "format": "bestaudio/best",
@@ -171,12 +213,82 @@ class MusicControlView(discord.ui.View):
         await interaction.followup.send(message, ephemeral=True)
 
 
+class RadioPresetSelect(discord.ui.Select):
+    def __init__(self, cog: "MusicCog", guild_id: int, presets: list[dict]) -> None:
+        self.cog = cog
+        self.guild_id = guild_id
+        options: list[discord.SelectOption] = []
+        for idx, preset in enumerate(presets[:25], start=1):
+            preset_name = str(preset.get("name") or f"Preset {idx}")
+            preset_id = str(preset.get("id") or f"preset_{idx}")
+            description = str(preset.get("description") or "Radio preset")
+            options.append(
+                discord.SelectOption(
+                    label=preset_name[:100],
+                    value=preset_id[:100],
+                    description=description[:100],
+                )
+            )
+        super().__init__(
+            placeholder="Select a radio station...",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild or interaction.guild.id != self.guild_id:
+            await interaction.response.send_message("This radio menu belongs to a different server.", ephemeral=True)
+            return
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This radio menu works in a server only.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        try:
+            track, source_note = await self.cog.resolve_radio_preset_track(self.values[0], interaction.user.mention)
+            channel_id = interaction.channel.id if interaction.channel else None
+            embed_title = await self.cog.enqueue_radio_track(
+                interaction.guild,
+                interaction.user,
+                channel_id,
+                track,
+                switch_now=True,
+            )
+        except RuntimeError as e:
+            await interaction.followup.send(str(e), ephemeral=True)
+            return
+        except Exception as e:
+            log.warning("Radio preset selection failed in guild %s: %s", interaction.guild.id, e)
+            await interaction.followup.send("Could not start that station right now.", ephemeral=True)
+            return
+
+        await interaction.followup.send(
+            embed=self.cog.build_added_radio_embed(track, source_note, title=embed_title),
+            ephemeral=True,
+        )
+
+
+class RadioPresetView(discord.ui.View):
+    def __init__(self, cog: "MusicCog", guild_id: int, presets: list[dict]) -> None:
+        super().__init__(timeout=300)
+        self.guild_id = guild_id
+        self.add_item(RadioPresetSelect(cog, guild_id, presets))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return bool(interaction.guild and interaction.guild.id == self.guild_id)
+
+
 class MusicCog(commands.Cog):
     def __init__(self, bot: commands.Bot, prefix: str) -> None:
         self.bot = bot
         self.prefix = prefix
         self.states: dict[int, GuildMusicState] = {}
         self.embed_color = discord.Color.from_rgb(103, 28, 43)
+        raw_presets_path = os.getenv("RADIO_PRESETS_FILE", "").strip()
+        self.radio_presets_path = raw_presets_path or RADIO_PRESETS_FILE
+        self.radio_presets = self.load_radio_presets()
         self.spotify_market: Optional[str] = None
         self.spotify = self._build_spotify_client()
         self.spotify_user = self._build_spotify_user_client()
@@ -1170,6 +1282,429 @@ class MusicCog(commands.Cog):
         lowered = value.strip().lower()
         return lowered.startswith("http://") or lowered.startswith("https://")
 
+    def _default_radio_presets(self) -> list[dict]:
+        defaults: list[dict] = []
+        for preset in DEFAULT_RADIO_PRESETS:
+            if not isinstance(preset, dict):
+                continue
+            copied = dict(preset)
+            aliases = copied.get("aliases")
+            if isinstance(aliases, list):
+                copied["aliases"] = [str(alias).strip() for alias in aliases if str(alias).strip()]
+            defaults.append(copied)
+        return defaults
+
+    def _validate_radio_presets(self, payload: object, *, source: str) -> list[dict]:
+        if not isinstance(payload, list):
+            log.warning("Radio presets source %s is not a JSON array.", source)
+            return []
+
+        valid: list[dict] = []
+        seen_ids: set[str] = set()
+
+        for idx, raw in enumerate(payload, start=1):
+            if not isinstance(raw, dict):
+                log.warning("Skipping radio preset #%s from %s: expected object.", idx, source)
+                continue
+
+            preset_id = str(raw.get("id") or "").strip()
+            name = str(raw.get("name") or "").strip()
+            stream_url = str(raw.get("stream_url") or "").strip()
+            stream_urls_raw = raw.get("stream_urls")
+            stream_urls: list[str] = []
+            if isinstance(stream_urls_raw, list):
+                for entry in stream_urls_raw:
+                    candidate = str(entry).strip()
+                    if not candidate:
+                        continue
+                    if not self._is_http_url(candidate):
+                        log.warning(
+                            "Ignoring invalid stream_urls entry for preset '%s' from %s: %s",
+                            preset_id or f"#{idx}",
+                            source,
+                            candidate,
+                        )
+                        continue
+                    if candidate not in stream_urls:
+                        stream_urls.append(candidate)
+            elif isinstance(stream_urls_raw, str):
+                candidate = stream_urls_raw.strip()
+                if candidate:
+                    if self._is_http_url(candidate):
+                        stream_urls.append(candidate)
+                    else:
+                        log.warning(
+                            "Ignoring invalid stream_urls value for preset '%s' from %s: %s",
+                            preset_id or f"#{idx}",
+                            source,
+                            candidate,
+                        )
+            query = str(raw.get("query") or "").strip()
+
+            normalized_id = self._normalize_radio_key(preset_id)
+            if not normalized_id:
+                log.warning("Skipping radio preset #%s from %s: missing id.", idx, source)
+                continue
+            if normalized_id in seen_ids:
+                log.warning("Skipping duplicate radio preset id '%s' from %s.", preset_id, source)
+                continue
+            if not name:
+                log.warning("Skipping radio preset '%s' from %s: missing name.", preset_id, source)
+                continue
+            if stream_url and not self._is_http_url(stream_url):
+                log.warning(
+                    "Ignoring invalid stream_url for preset '%s' from %s: %s",
+                    preset_id,
+                    source,
+                    stream_url,
+                )
+                stream_url = ""
+            has_stream = bool(stream_url or stream_urls)
+            if not has_stream and not query:
+                log.warning(
+                    "Skipping radio preset '%s' from %s: needs stream_url/stream_urls or query.",
+                    preset_id,
+                    source,
+                )
+                continue
+
+            cleaned: dict = {
+                "id": preset_id,
+                "name": name,
+            }
+            if stream_url:
+                cleaned["stream_url"] = stream_url
+            if stream_urls:
+                cleaned["stream_urls"] = stream_urls
+            if query:
+                cleaned["query"] = query
+
+            homepage = str(raw.get("homepage") or "").strip()
+            description = str(raw.get("description") or "").strip()
+            if homepage:
+                cleaned["homepage"] = homepage
+            if description:
+                cleaned["description"] = description
+
+            aliases_raw = raw.get("aliases")
+            aliases: list[str] = []
+            if isinstance(aliases_raw, list):
+                aliases = [str(alias).strip() for alias in aliases_raw if str(alias).strip()]
+            elif isinstance(aliases_raw, str) and aliases_raw.strip():
+                aliases = [aliases_raw.strip()]
+            if aliases:
+                cleaned["aliases"] = aliases
+
+            valid.append(cleaned)
+            seen_ids.add(normalized_id)
+
+        return valid
+
+    def _write_radio_presets_file(self, presets: list[dict], *, path: str) -> None:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(presets, handle, indent=2, ensure_ascii=True)
+            handle.write("\n")
+
+    def load_radio_presets(self) -> list[dict]:
+        defaults = self._validate_radio_presets(self._default_radio_presets(), source="built-in defaults")
+        if not defaults:
+            defaults = self._default_radio_presets()
+
+        path = self.radio_presets_path
+        if not os.path.exists(path):
+            try:
+                self._write_radio_presets_file(defaults, path=path)
+                log.info("Created default radio presets file at %s", path)
+            except OSError as e:
+                log.warning("Could not create radio presets file at %s: %s", path, e)
+            return defaults
+
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except Exception as e:
+            log.warning("Could not load radio presets file %s: %s", path, e)
+            return defaults
+
+        validated = self._validate_radio_presets(payload, source=path)
+        if not validated:
+            log.warning("Radio presets file %s had no valid presets. Using defaults in memory.", path)
+            return defaults
+        return validated
+
+    def _normalize_radio_key(self, value: str) -> str:
+        lowered = value.lower().strip()
+        return re.sub(r"[^a-z0-9]+", "", lowered)
+
+    def _radio_presets(self) -> list[dict]:
+        return self.radio_presets
+
+    def _radio_preset_by_id(self, preset_id: str) -> Optional[dict]:
+        target = self._normalize_radio_key(preset_id)
+        if not target:
+            return None
+
+        for preset in self._radio_presets():
+            preset_key = self._normalize_radio_key(str(preset.get("id") or ""))
+            if preset_key and preset_key == target:
+                return preset
+        return None
+
+    def _radio_preset_from_text(self, text: str) -> Optional[dict]:
+        target = self._normalize_radio_key(text)
+        if not target:
+            return None
+
+        for preset in self._radio_presets():
+            candidates: list[str] = []
+            preset_id = preset.get("id")
+            preset_name = preset.get("name")
+            if isinstance(preset_id, str):
+                candidates.append(preset_id)
+            if isinstance(preset_name, str):
+                candidates.append(preset_name)
+
+            aliases = preset.get("aliases")
+            if isinstance(aliases, list):
+                for alias in aliases:
+                    if isinstance(alias, str):
+                        candidates.append(alias)
+
+            for candidate in candidates:
+                if self._normalize_radio_key(candidate) == target:
+                    return preset
+        return None
+
+    def build_radio_menu_embed(self) -> discord.Embed:
+        presets = self._radio_presets()
+        embed = discord.Embed(
+            title="KithWave Radio Dial",
+            color=self.embed_color,
+            description="Choose a preset station from the dropdown below.",
+        )
+
+        if presets:
+            lines = []
+            for preset in presets[:12]:
+                name = str(preset.get("name") or "Unnamed preset")
+                detail = str(preset.get("description") or "Live radio stream")
+                lines.append(f"**{name}** - {detail}")
+            embed.add_field(name="Presets", value="\n".join(lines), inline=False)
+        else:
+            embed.add_field(name="Presets", value="No presets are configured.", inline=False)
+
+        embed.add_field(
+            name="Quick Play",
+            value=f"`{self.prefix}radio <preset|station name|stream URL>` still works too.",
+            inline=False,
+        )
+        embed.set_footer(text="KithWave")
+        return embed
+
+    def build_added_radio_embed(
+        self,
+        track: Track,
+        source_note: Optional[str],
+        *,
+        title: str = "Added Radio Stream",
+    ) -> discord.Embed:
+        embed = discord.Embed(color=self.embed_color, title=title)
+        embed.description = f"[{track.title}]({track.webpage_url})"
+        embed.add_field(name="Length", value="`Live`", inline=True)
+        if source_note:
+            embed.add_field(name="Source", value=source_note, inline=False)
+        embed.set_footer(text="KithWave")
+        return embed
+
+    async def resolve_radio_preset_track(self, preset_id: str, requester: str) -> tuple[Track, Optional[str]]:
+        preset = self._radio_preset_by_id(preset_id)
+        if not preset:
+            raise RuntimeError("That preset station was not found.")
+
+        preset_name = str(preset.get("name") or "Radio Preset")
+        preset_key = str(preset.get("id") or preset_name)
+        stream_url = str(preset.get("stream_url") or "").strip()
+        stream_urls_raw = preset.get("stream_urls")
+        homepage = str(preset.get("homepage") or "").strip()
+        query = str(preset.get("query") or "").strip()
+
+        stream_candidates: list[str] = []
+        if stream_url:
+            stream_candidates.append(stream_url)
+        if isinstance(stream_urls_raw, list):
+            for entry in stream_urls_raw:
+                candidate = str(entry).strip()
+                if not candidate or not self._is_http_url(candidate):
+                    continue
+                if candidate not in stream_candidates:
+                    stream_candidates.append(candidate)
+        elif isinstance(stream_urls_raw, str):
+            candidate = stream_urls_raw.strip()
+            if candidate and self._is_http_url(candidate) and candidate not in stream_candidates:
+                stream_candidates.append(candidate)
+
+        if stream_candidates:
+            primary_stream_url = stream_candidates[0]
+            fallback_track = Track(
+                title=preset_name,
+                stream_url=primary_stream_url,
+                webpage_url=homepage or primary_stream_url,
+                duration=None,
+                thumbnail=None,
+                requested_by=requester,
+                source_query=f"preset:{preset_key}:stream",
+            )
+
+            track: Optional[Track] = None
+            for index, candidate_url in enumerate(stream_candidates, start=1):
+                try:
+                    track = await self.extract_track(candidate_url, requester)
+                    break
+                except Exception as e:
+                    log.warning(
+                        "Preset stream extraction failed for '%s' candidate %s/%s (%s): %s",
+                        preset_name,
+                        index,
+                        len(stream_candidates),
+                        candidate_url,
+                        e,
+                    )
+
+            if track is None:
+                if query:
+                    try:
+                        query_track, source_note = await self.resolve_radio_track(query, requester)
+                        if query_track.title.strip().lower().startswith("http"):
+                            query_track.title = preset_name
+                        if homepage and (not query_track.webpage_url or query_track.webpage_url == query):
+                            query_track.webpage_url = homepage
+                        query_track.source_query = f"preset:{preset_key}:query"
+                        preset_note = f"Preset `{preset_name}` (fallback query)."
+                        if source_note:
+                            return query_track, f"{preset_note} {source_note}"
+                        return query_track, preset_note
+                    except Exception as query_e:
+                        log.warning("Preset query fallback failed for '%s': %s", preset_name, query_e)
+                return fallback_track, f"Preset `{preset_name}`."
+
+            if track.title.strip().lower().startswith("http"):
+                track.title = preset_name
+            if homepage:
+                track.webpage_url = homepage
+            track.source_query = f"preset:{preset_key}:stream"
+            return track, f"Preset `{preset_name}`."
+
+        if query:
+            track, source_note = await self.resolve_radio_track(query, requester)
+            if track.title.strip().lower().startswith("http"):
+                track.title = preset_name
+            if homepage and (not track.webpage_url or track.webpage_url == query):
+                track.webpage_url = homepage
+            track.source_query = f"preset:{preset_key}:query"
+
+            preset_note = f"Preset `{preset_name}`."
+            if source_note:
+                return track, f"{preset_note} {source_note}"
+            return track, preset_note
+
+        raise RuntimeError(f"Preset `{preset_name}` is missing both stream_url and query.")
+
+    async def enqueue_radio_track(
+        self,
+        guild: discord.Guild,
+        member: discord.Member,
+        channel_id: Optional[int],
+        track: Track,
+        *,
+        switch_now: bool = True,
+    ) -> str:
+        voice_client = await self.ensure_voice(guild, member)
+        state = self.get_state(guild.id)
+        if channel_id:
+            state.channel_id = channel_id
+        if switch_now:
+            state.queue.clear()
+            state.queue.insert(0, track)
+            if voice_client.is_playing() or voice_client.is_paused():
+                voice_client.stop()
+                return "Switched Radio Station"
+            await self.play_next(guild)
+            return "Started Radio Station"
+
+        state.queue.append(track)
+        if not voice_client.is_playing() and not voice_client.is_paused():
+            await self.play_next(guild)
+        return "Queued Radio Stream"
+
+    async def _send_channel_message(self, guild: discord.Guild, message: str) -> None:
+        state = self.get_state(guild.id)
+        if not state.channel_id:
+            return
+        channel = guild.get_channel(state.channel_id)
+        if not channel or not isinstance(channel, discord.abc.Messageable):
+            return
+        try:
+            await channel.send(message)
+        except discord.HTTPException:
+            pass
+
+    async def _maybe_queue_preset_query_fallback(self, guild: discord.Guild, track: Track) -> Optional[str]:
+        source_value = (track.source_query or "").strip()
+        if not source_value.startswith("preset:"):
+            return None
+
+        parts = source_value.split(":", 2)
+        if len(parts) != 3:
+            return None
+        preset_id = parts[1]
+        mode = parts[2].lower()
+        if mode != "stream":
+            return None
+
+        preset = self._radio_preset_by_id(preset_id)
+        if not preset:
+            return None
+        query = str(preset.get("query") or "").strip()
+        if not query:
+            return None
+
+        try:
+            fallback_track, _ = await self.resolve_radio_track(query, track.requested_by)
+        except Exception as e:
+            log.warning("Preset playback fallback query failed for preset '%s': %s", preset_id, e)
+            return None
+
+        preset_name = str(preset.get("name") or track.title or "radio preset")
+        homepage = str(preset.get("homepage") or "").strip()
+        if fallback_track.title.strip().lower().startswith("http"):
+            fallback_track.title = preset_name
+        if homepage and (not fallback_track.webpage_url or fallback_track.webpage_url == query):
+            fallback_track.webpage_url = homepage
+        fallback_track.source_query = f"preset:{preset_id}:query_fallback"
+
+        state = self.get_state(guild.id)
+        state.queue.insert(0, fallback_track)
+        return f"Direct stream for `{preset_name}` failed. Trying fallback station match."
+
+    async def _handle_after_play(
+        self,
+        guild: discord.Guild,
+        track: Track,
+        error: Optional[Exception],
+    ) -> None:
+        if error:
+            log.error("Player error in guild %s for '%s': %s", guild.id, track.title, error)
+            fallback_msg = await self._maybe_queue_preset_query_fallback(guild, track)
+            if fallback_msg:
+                await self._send_channel_message(guild, fallback_msg)
+            else:
+                await self._send_channel_message(
+                    guild,
+                    f"Playback failed for `{track.title}`. The stream may be offline or geo-blocked.",
+                )
+
+        await self.play_next(guild)
+
     def _radio_search_sync(self, station_query: str, limit: int = RADIO_SEARCH_LIMIT) -> list[dict]:
         cleaned_query = station_query.strip()
         if not cleaned_query:
@@ -1481,9 +2016,7 @@ class MusicCog(commands.Cog):
             state.current = track
 
             def after_play(error: Optional[Exception]) -> None:
-                if error:
-                    log.error("Player error in guild %s: %s", guild.id, error)
-                asyncio.run_coroutine_threadsafe(self.play_next(guild), self.bot.loop)
+                asyncio.run_coroutine_threadsafe(self._handle_after_play(guild, track, error), self.bot.loop)
 
             raw_source = discord.FFmpegPCMAudio(track.stream_url, **FFMPEG_OPTIONS)
             source = discord.PCMVolumeTransformer(raw_source, volume=state.volume)
@@ -1766,39 +2299,57 @@ class MusicCog(commands.Cog):
             await self.play_next(ctx.guild)
 
     @commands.command(name="radio")
-    async def radio_cmd(self, ctx: commands.Context, *, station_or_url: str) -> None:
+    async def radio_cmd(self, ctx: commands.Context, *, station_or_url: Optional[str] = None) -> None:
         if not ctx.guild or not isinstance(ctx.author, discord.Member):
             await ctx.send("This command works in a server only.")
             return
 
-        try:
-            voice_client = await self.ensure_voice(ctx.guild, ctx.author)
-        except RuntimeError as e:
-            await ctx.send(str(e))
-            return
+        station_text = (station_or_url or "").strip()
+        presets = self._radio_presets()
 
-        state = self.get_state(ctx.guild.id)
-        state.channel_id = ctx.channel.id
+        if not station_text:
+            if not presets:
+                await ctx.send("No radio presets are configured.")
+                return
+            view = RadioPresetView(self, ctx.guild.id, presets)
+            await ctx.send(embed=self.build_radio_menu_embed(), view=view)
+            return
 
         async with ctx.typing():
             try:
-                track, source_note = await self.resolve_radio_track(station_or_url, ctx.author.mention)
+                preset = self._radio_preset_from_text(station_text)
+                if preset:
+                    preset_id = str(preset.get("id") or station_text)
+                    track, source_note = await self.resolve_radio_preset_track(preset_id, ctx.author.mention)
+                else:
+                    track, source_note = await self.resolve_radio_track(station_text, ctx.author.mention)
+                embed_title = await self.enqueue_radio_track(
+                    ctx.guild,
+                    ctx.author,
+                    ctx.channel.id,
+                    track,
+                    switch_now=True,
+                )
             except RuntimeError as e:
                 await ctx.send(str(e))
                 return
+            except Exception as e:
+                log.warning("Radio command failed for guild %s query '%s': %s", ctx.guild.id, station_text, e)
+                await ctx.send("Could not start that radio station right now.")
+                return
 
-        state.queue.append(track)
+        await ctx.send(embed=self.build_added_radio_embed(track, source_note, title=embed_title))
 
-        embed = discord.Embed(color=self.embed_color, title="Added Radio Stream")
-        embed.description = f"[{track.title}]({track.webpage_url})"
-        embed.add_field(name="Length", value="`Live`", inline=True)
-        if source_note:
-            embed.add_field(name="Source", value=source_note, inline=False)
-        embed.set_footer(text="KithWave")
-        await ctx.send(embed=embed)
+    @commands.command(name="radioreload", aliases=["radioload"])
+    async def radioreload_cmd(self, ctx: commands.Context) -> None:
+        if not await self.can_manage_spotify_auth(ctx):
+            await ctx.send("Only server managers can reload radio presets.")
+            return
 
-        if not voice_client.is_playing() and not voice_client.is_paused():
-            await self.play_next(ctx.guild)
+        self.radio_presets = self.load_radio_presets()
+        await ctx.send(
+            f"Reloaded `{len(self.radio_presets)}` radio preset(s) from `{self.radio_presets_path}`."
+        )
 
     @commands.command(name="queue")
     async def queue_cmd(self, ctx: commands.Context) -> None:
