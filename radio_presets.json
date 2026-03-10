@@ -104,6 +104,24 @@
     ]
   },
   {
+    "id": "arirangradio",
+    "name": "Arirang Radio",
+    "stream_url": "https://amdlive-ch03-ctnd-com.akamaized.net/arirang_3ch/smil:arirang_3ch.smil/playlist.m3u8",
+    "stream_urls": [
+      "https://amdlive-ch02-ctnd-com.akamaized.net/arirang_3ch/smil:arirang_3ch.smil/playlist.m3u8",
+      "http://amdlive-ch01.ctnd.com.edgesuite.net/arirang_3ch/smil:arirang_3ch.smil/playlist.m3u8"
+    ],
+    "query": "arirang radio",
+    "homepage": "https://www.arirang.com/radio",
+    "description": "Korean station with English-speaking hosts and K-pop programming.",
+    "aliases": [
+      "arirang",
+      "arirang radio",
+      "k-poppin",
+      "kpop english"
+    ]
+  },
+  {
     "id": "clyde1",
     "name": "Clyde 1",
     "stream_url": "https://edge-bauerall-01-gos2.sharp-stream.com/clyde1.mp3",
@@ -139,6 +157,39 @@
       "star1021",
       "star texas",
       "iheart star 1021"
+    ]
+  },
+  {
+    "id": "thebeat1011nashville",
+    "name": "101.1 The Beat (Nashville)",
+    "stream_url": "https://stream.revma.ihrhls.com/zc2153",
+    "stream_urls": [
+      "https://stream.revma.ihrhls.com/zc2153/hls.m3u8",
+      "http://stream.revma.ihrhls.com/zc2153",
+      "http://stream.revma.ihrhls.com/zc2153/hls.m3u8"
+    ],
+    "query": "101.1 the beat nashville",
+    "homepage": "https://1011thebeat.iheart.com/",
+    "description": "Nashville hip-hop and R&B station (WUBT).",
+    "aliases": [
+      "101.1 the beat",
+      "the beat nashville",
+      "wubt",
+      "1011 the beat"
+    ]
+  },
+  {
+    "id": "yoco967nashville",
+    "name": "YoCo Nashville 96.7",
+    "stream_url": "https://wycz.streamguys1.com/live",
+    "query": "yoco nashville 96.7",
+    "homepage": "https://www.yoconashville.com/",
+    "description": "Eclectic Nashville station (WYCZ / YoCo 96.7).",
+    "aliases": [
+      "yoco",
+      "yoco 96.7",
+      "yoco nashville",
+      "wycz"
     ]
   },
   {

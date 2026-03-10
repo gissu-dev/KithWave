@@ -3,10 +3,18 @@ $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $programsDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"
 $legacyDir = Join-Path $programsDir "KithWave"
+$roamingRoot = Split-Path -Parent $programsDir
+$appDataRoot = Split-Path -Parent $roamingRoot
+$profileRoot = Split-Path -Parent $appDataRoot
+$defaultRoot = Join-Path $profileRoot "KithWave"
+$defaultBatch = Join-Path $defaultRoot "kithwave.bat"
+$scriptBatch = Join-Path $projectRoot "kithwave.bat"
+$batchPath = if (Test-Path $defaultBatch) { $defaultBatch } else { $scriptBatch }
+$batchRoot = Split-Path -Parent $batchPath
 
 $wsh = New-Object -ComObject WScript.Shell
 
-foreach ($legacyName in @("KithWave Control.lnk", "KithWave Start.lnk", "KithWave Stop.lnk")) {
+foreach ($legacyName in @("KithWave.lnk", "KithWave Stop.lnk", "KithWave Control.lnk", "KithWave Start.lnk")) {
     $legacyInPrograms = Join-Path $programsDir $legacyName
     if (Test-Path $legacyInPrograms) {
         try {
@@ -34,13 +42,22 @@ if (Test-Path $legacyDir) {
     }
 }
 
-$lnkPath = Join-Path $programsDir "KithWave.lnk"
-$shortcut = $wsh.CreateShortcut($lnkPath)
-$shortcut.TargetPath = "$env:SystemRoot\System32\cmd.exe"
-$shortcut.Arguments = "/c kithwave.bat"
-$shortcut.WorkingDirectory = $projectRoot
-$shortcut.IconLocation = "$env:SystemRoot\System32\shell32.dll,220"
-$shortcut.Save()
+$mainLnkPath = Join-Path $programsDir "KithWave.lnk"
+$mainShortcut = $wsh.CreateShortcut($mainLnkPath)
+$mainShortcut.TargetPath = "$env:SystemRoot\System32\cmd.exe"
+$mainShortcut.Arguments = "/c kithwave.bat menu"
+$mainShortcut.WorkingDirectory = $batchRoot
+$mainShortcut.IconLocation = "$batchPath,0"
+$mainShortcut.Save()
 
-Write-Host "Installed Start Menu shortcut:"
-Write-Host $lnkPath
+$stopLnkPath = Join-Path $programsDir "KithWave Stop.lnk"
+$stopShortcut = $wsh.CreateShortcut($stopLnkPath)
+$stopShortcut.TargetPath = "$env:SystemRoot\System32\cmd.exe"
+$stopShortcut.Arguments = "/c kithwave.bat stop"
+$stopShortcut.WorkingDirectory = $batchRoot
+$stopShortcut.IconLocation = "$batchPath,0"
+$stopShortcut.Save()
+
+Write-Host "Installed Start Menu shortcuts:"
+Write-Host $mainLnkPath
+Write-Host $stopLnkPath

@@ -4,8 +4,11 @@ import logging
 import os
 import random
 import re
+import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional
+from urllib.error import HTTPError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
@@ -82,6 +85,19 @@ DEFAULT_RADIO_PRESETS = [
         "description": "Synthwave and retrowave station.",
         "aliases": ["nightride", "synthwave"],
     },
+    {
+        "id": "arirangradio",
+        "name": "Arirang Radio",
+        "stream_url": "https://amdlive-ch03-ctnd-com.akamaized.net/arirang_3ch/smil:arirang_3ch.smil/playlist.m3u8",
+        "stream_urls": [
+            "https://amdlive-ch02-ctnd-com.akamaized.net/arirang_3ch/smil:arirang_3ch.smil/playlist.m3u8",
+            "http://amdlive-ch01.ctnd.com.edgesuite.net/arirang_3ch/smil:arirang_3ch.smil/playlist.m3u8",
+        ],
+        "query": "arirang radio",
+        "homepage": "https://www.arirang.com/radio",
+        "description": "Korean station with English-speaking hosts and K-pop programming.",
+        "aliases": ["arirang", "arirang radio", "k-poppin", "kpop english"],
+    },
 ]
 
 YTDL_OPTIONS = {
@@ -133,7 +149,7 @@ class Track:
 
 class GuildMusicState:
     def __init__(self) -> None:
-        self.queue: list[Track] = []
+        self.queue: deque[Track] = deque()
         self.current: Optional[Track] = None
         self.channel_id: Optional[int] = None
         self.control_message_id: Optional[int] = None
@@ -285,6 +301,7 @@ class MusicCog(commands.Cog):
         self.bot = bot
         self.prefix = prefix
         self.states: dict[int, GuildMusicState] = {}
+        self.import_tasks: dict[int, set[asyncio.Task[None]]] = {}
         self.embed_color = discord.Color.from_rgb(103, 28, 43)
         raw_presets_path = os.getenv("RADIO_PRESETS_FILE", "").strip()
         self.radio_presets_path = raw_presets_path or RADIO_PRESETS_FILE
@@ -355,6 +372,36 @@ class MusicCog(commands.Cog):
         if guild_id not in self.states:
             self.states[guild_id] = GuildMusicState()
         return self.states[guild_id]
+
+    def _register_import_task(self, guild_id: int, task: asyncio.Task[None]) -> None:
+        tasks = self.import_tasks.setdefault(guild_id, set())
+        tasks.add(task)
+
+        def _done(done_task: asyncio.Task[None]) -> None:
+            guild_tasks = self.import_tasks.get(guild_id)
+            if guild_tasks is not None:
+                guild_tasks.discard(done_task)
+                if not guild_tasks:
+                    self.import_tasks.pop(guild_id, None)
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                log.warning("Background import task failed for guild %s: %s", guild_id, e)
+
+        task.add_done_callback(_done)
+
+    def _cancel_import_tasks(self, guild_id: int) -> int:
+        tasks = self.import_tasks.pop(guild_id, None)
+        if not tasks:
+            return 0
+        cancelled = 0
+        for task in list(tasks):
+            if not task.done():
+                task.cancel()
+                cancelled += 1
+        return cancelled
 
     def _status_artist_title(self, track: Track) -> tuple[str, str]:
         for artist, title in self._lyrics_artist_title_candidates(track):
@@ -531,9 +578,21 @@ class MusicCog(commands.Cog):
 
     def _http_get_json_sync(self, url: str) -> object:
         request = Request(url, headers={"User-Agent": "KithWave/1.0"})
-        with urlopen(request, timeout=12) as response:
-            payload = response.read().decode("utf-8", errors="replace")
-        return json.loads(payload)
+        attempts = 3
+        for attempt in range(attempts):
+            try:
+                with urlopen(request, timeout=12) as response:
+                    payload = response.read().decode("utf-8", errors="replace")
+                return json.loads(payload)
+            except HTTPError as e:
+                is_retryable = e.code == 429 or e.code >= 500
+                if not is_retryable or attempt >= attempts - 1:
+                    raise
+            except Exception:
+                if attempt >= attempts - 1:
+                    raise
+            time.sleep(0.35 * (attempt + 1))
+        raise RuntimeError(f"Could not load JSON from {url}")
 
     def _clean_lyrics_query(self, text: str) -> str:
         cleaned = text.strip()
@@ -1623,8 +1682,11 @@ class MusicCog(commands.Cog):
         if channel_id:
             state.channel_id = channel_id
         if switch_now:
+            cancelled = self._cancel_import_tasks(guild.id)
+            if cancelled:
+                log.info("Canceled %s background import task(s) for guild %s before radio switch.", cancelled, guild.id)
             state.queue.clear()
-            state.queue.insert(0, track)
+            state.queue.appendleft(track)
             if voice_client.is_playing() or voice_client.is_paused():
                 voice_client.stop()
                 return "Switched Radio Station"
@@ -1683,7 +1745,7 @@ class MusicCog(commands.Cog):
         fallback_track.source_query = f"preset:{preset_id}:query_fallback"
 
         state = self.get_state(guild.id)
-        state.queue.insert(0, fallback_track)
+        state.queue.appendleft(fallback_track)
         return f"Direct stream for `{preset_name}` failed. Trying fallback station match."
 
     async def _handle_after_play(
@@ -2003,6 +2065,9 @@ class MusicCog(commands.Cog):
         if not voice_client:
             return
 
+        failed_track: Optional[Track] = None
+        startup_error: Optional[Exception] = None
+
         async with state.lock:
             if not state.queue:
                 state.current = None
@@ -2012,15 +2077,25 @@ class MusicCog(commands.Cog):
                 await self.delete_control_panel(guild)
                 return
 
-            track = state.queue.pop(0)
+            track = state.queue.popleft()
             state.current = track
 
             def after_play(error: Optional[Exception]) -> None:
                 asyncio.run_coroutine_threadsafe(self._handle_after_play(guild, track, error), self.bot.loop)
 
-            raw_source = discord.FFmpegPCMAudio(track.stream_url, **FFMPEG_OPTIONS)
-            source = discord.PCMVolumeTransformer(raw_source, volume=state.volume)
-            voice_client.play(source, after=after_play)
+            try:
+                raw_source = discord.FFmpegPCMAudio(track.stream_url, **FFMPEG_OPTIONS)
+                source = discord.PCMVolumeTransformer(raw_source, volume=state.volume)
+                voice_client.play(source, after=after_play)
+            except Exception as e:
+                state.current = None
+                failed_track = track
+                startup_error = e
+
+        if failed_track and startup_error:
+            log.warning("Failed to start playback in guild %s for '%s': %s", guild.id, failed_track.title, startup_error)
+            await self._handle_after_play(guild, failed_track, startup_error)
+            return
 
         await self.send_now_playing_embed(guild)
         await self.sync_voice_channel_status(guild)
@@ -2139,7 +2214,7 @@ class MusicCog(commands.Cog):
             embed.add_field(name="Up Next", value="No hymns are waiting.", inline=False)
         else:
             lines = []
-            for idx, track in enumerate(state.queue[:10], start=1):
+            for idx, track in enumerate(list(state.queue)[:10], start=1):
                 lines.append(f"**{idx}.** [{track.title}]({track.webpage_url}) | `{format_duration(track.duration)}`")
             embed.add_field(name="Up Next", value="\n".join(lines), inline=False)
 
@@ -2171,6 +2246,7 @@ class MusicCog(commands.Cog):
         if not guild:
             return False, "Guild not found."
         state = self.get_state(guild.id)
+        self._cancel_import_tasks(guild.id)
         state.queue.clear()
         state.current = None
         vc = guild.voice_client
@@ -2206,7 +2282,10 @@ class MusicCog(commands.Cog):
         state = self.get_state(guild.id)
         if len(state.queue) < 2:
             return False, "Need at least 2 queued tracks to shuffle."
-        random.shuffle(state.queue)
+        shuffled = list(state.queue)
+        random.shuffle(shuffled)
+        state.queue.clear()
+        state.queue.extend(shuffled)
         return True, f"Shuffled `{len(state.queue)}` queued tracks."
 
     @commands.command(name="play")
@@ -2264,7 +2343,7 @@ class MusicCog(commands.Cog):
             return
 
         if remaining_queries:
-            asyncio.create_task(
+            task = asyncio.create_task(
                 self.import_remaining_queries(
                     guild_id=ctx.guild.id,
                     channel_id=ctx.channel.id,
@@ -2272,6 +2351,7 @@ class MusicCog(commands.Cog):
                     queries=remaining_queries,
                 )
             )
+            self._register_import_task(ctx.guild.id, task)
 
         embed = discord.Embed(color=self.embed_color, title="Added to KithWave Queue")
         if len(pending_queries) > 1:
@@ -2513,6 +2593,7 @@ class MusicCog(commands.Cog):
         if not self.bot.user or member.id != self.bot.user.id:
             return
         if before.channel and after.channel is None:
+            self._cancel_import_tasks(member.guild.id)
             await self.clear_voice_channel_status(member.guild, before.channel)
             await self.delete_control_panel(member.guild)
 
