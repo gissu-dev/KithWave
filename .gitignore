@@ -13,8 +13,8 @@ __pycache__/
 
 # Runtime state / caches
 kithwave.pid
-.cache
-.spotify_user_cache
+.cache*
+.spotify_user_cache*
 
 # Logs
 *.log

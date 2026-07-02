@@ -1,9 +1,12 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import random
 import re
+import shlex
+import struct
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -28,8 +31,34 @@ except ImportError:
 
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(name)s: %(message)s")
+LOG_FORMAT = "[%(asctime)s] %(levelname)s %(name)s: %(message)s"
+LOG_FILE = os.getenv("KITHWAVE_LOG_FILE", "kithwave.log")
+FFMPEG_LOG_FILE = os.getenv("KITHWAVE_FFMPEG_LOG_FILE", "kithwave-ffmpeg.log")
+log_handlers: list[logging.Handler] = [logging.StreamHandler()]
+try:
+    log_handlers.append(logging.FileHandler(LOG_FILE, encoding="utf-8"))
+except OSError:
+    pass
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, handlers=log_handlers)
 log = logging.getLogger("kithwave")
+
+
+def ensure_opus_loaded() -> None:
+    if discord.opus.is_loaded():
+        log.info("Discord Opus library already loaded.")
+        return
+
+    bin_dir = os.path.join(os.path.dirname(os.path.abspath(discord.__file__)), "bin")
+    opus_path = os.path.join(bin_dir, "libopus-0.x64.dll")
+    try:
+        discord.opus.load_opus(opus_path)
+    except Exception as e:
+        log.warning("Could not explicitly load Discord Opus from %s: %s", opus_path, e)
+        return
+    log.info("Discord Opus loaded from %s.", opus_path)
+
+
+ensure_opus_loaded()
 
 SPOTIFY_URL_RE = re.compile(r"https?://open\.spotify\.com/(track|album|playlist)/([A-Za-z0-9]+)")
 SPOTIFY_TRACK_ID_RE = re.compile(r"(?:spotify:track:|/tracks?/)([A-Za-z0-9]{22})")
@@ -109,10 +138,16 @@ YTDL_OPTIONS = {
     "extract_flat": False,
 }
 
+FFMPEG_BEFORE_ARGS = ["-nostdin", "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
 FFMPEG_OPTIONS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+    "before_options": shlex.join(FFMPEG_BEFORE_ARGS),
     "options": "-vn",
 }
+try:
+    DEFAULT_VOLUME = float(os.getenv("KITHWAVE_DEFAULT_VOLUME", "0.8"))
+except ValueError:
+    DEFAULT_VOLUME = 0.8
+DEFAULT_VOLUME = max(0.0, min(2.0, DEFAULT_VOLUME))
 
 ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
 ytdl_playlist = yt_dlp.YoutubeDL(
@@ -145,6 +180,119 @@ class Track:
     thumbnail: Optional[str]
     requested_by: str
     source_query: Optional[str] = None
+    http_headers: Optional[dict[str, str]] = None
+
+
+def brief_error_message(exc: Exception, limit: int = 220) -> str:
+    message = str(exc).strip() or exc.__class__.__name__
+    message = re.sub(r"\s+", " ", message)
+    if len(message) > limit:
+        message = message[: limit - 3].rstrip() + "..."
+    return message
+
+
+def brief_value(value: object, limit: int = 180) -> str:
+    message = str(value).strip()
+    message = re.sub(r"\s+", " ", message)
+    if len(message) > limit:
+        message = message[: limit - 3].rstrip() + "..."
+    return message
+
+
+def open_ffmpeg_stderr_log():
+    try:
+        return open(FFMPEG_LOG_FILE, "ab", buffering=0)
+    except OSError as e:
+        log.warning("Could not open FFmpeg log file %s: %s", FFMPEG_LOG_FILE, e)
+        return None
+
+
+def _ffmpeg_header_arg(headers: Optional[dict[str, str]]) -> Optional[str]:
+    if not headers:
+        return None
+
+    lines: list[str] = []
+    for key, value in headers.items():
+        clean_key = str(key).strip()
+        if not clean_key or "\r" in clean_key or "\n" in clean_key:
+            continue
+        clean_value = str(value).replace("\r", " ").replace("\n", " ").strip()
+        if clean_value:
+            lines.append(f"{clean_key}: {clean_value}")
+
+    if not lines:
+        return None
+    return "\r\n".join(lines) + "\r\n"
+
+
+def ffmpeg_options_for_track(track: Track) -> dict[str, str]:
+    before_args = list(FFMPEG_BEFORE_ARGS)
+    header_arg = _ffmpeg_header_arg(track.http_headers)
+    if header_arg:
+        before_args.extend(["-headers", header_arg])
+    return {
+        "before_options": shlex.join(before_args),
+        "options": FFMPEG_OPTIONS["options"],
+    }
+
+
+def describe_member_voice_state(member: Optional[discord.Member]) -> str:
+    voice = member.voice if member else None
+    if not voice:
+        return "voice_state=none"
+
+    fields = [
+        f"channel={getattr(voice.channel, 'id', 'unknown')}",
+        f"mute={voice.mute}",
+        f"deaf={voice.deaf}",
+        f"self_mute={voice.self_mute}",
+        f"self_deaf={voice.self_deaf}",
+        f"self_stream={voice.self_stream}",
+        f"self_video={voice.self_video}",
+    ]
+    suppress = getattr(voice, "suppress", None)
+    if suppress is not None:
+        fields.append(f"suppress={suppress}")
+    return " ".join(fields)
+
+
+def attach_voice_packet_counter(voice_client: Optional[discord.VoiceClient]) -> None:
+    if not voice_client:
+        return
+    connection = getattr(voice_client, "_connection", None)
+    if not connection or getattr(connection, "_kithwave_counter_attached", False):
+        return
+
+    original_send_packet = connection.send_packet
+    stats = {"attempts": 0, "bytes": 0, "errors": 0, "last_error": ""}
+
+    def counted_send_packet(packet: bytes) -> None:
+        stats["attempts"] += 1
+        stats["bytes"] += len(packet)
+        try:
+            original_send_packet(packet)
+        except OSError as e:
+            stats["errors"] += 1
+            stats["last_error"] = brief_error_message(e)
+            raise
+
+    connection.send_packet = counted_send_packet
+    connection._kithwave_counter_attached = True
+    connection._kithwave_packet_stats = stats
+    log.info("Attached voice packet counter for endpoint=%s mode=%s", voice_client.endpoint, voice_client.mode)
+
+
+def voice_packet_stats(voice_client: Optional[discord.VoiceClient]) -> str:
+    connection = getattr(voice_client, "_connection", None) if voice_client else None
+    stats = getattr(connection, "_kithwave_packet_stats", None) if connection else None
+    if not isinstance(stats, dict):
+        return "packets=unavailable"
+    return (
+        f"packet_attempts={stats.get('attempts', 0)} "
+        f"packet_bytes={stats.get('bytes', 0)} "
+        f"packet_errors={stats.get('errors', 0)} "
+        f"packet_last_error={stats.get('last_error') or 'none'}"
+    )
 
 
 class GuildMusicState:
@@ -153,8 +301,37 @@ class GuildMusicState:
         self.current: Optional[Track] = None
         self.channel_id: Optional[int] = None
         self.control_message_id: Optional[int] = None
-        self.volume: float = 0.03
+        self.volume: float = DEFAULT_VOLUME
         self.lock = asyncio.Lock()
+
+
+class ToneAudioSource(discord.AudioSource):
+    def __init__(self, *, frequency: float = 440.0, duration: float = 5.0, volume: float = 1.0) -> None:
+        self.sample_rate = 48000
+        self.frame_samples = 960
+        self.frequency = frequency
+        self.total_samples = int(duration * self.sample_rate)
+        self.volume = max(0.0, min(1.0, volume))
+        self.position = 0
+
+    def read(self) -> bytes:
+        if self.position >= self.total_samples:
+            return b""
+
+        remaining = self.total_samples - self.position
+        frame_count = min(self.frame_samples, remaining)
+        max_amp = int(32767 * self.volume)
+        chunks = bytearray()
+        for _ in range(frame_count):
+            value = int(max_amp * math.sin((2.0 * math.pi * self.frequency * self.position) / self.sample_rate))
+            chunks.extend(struct.pack("<hh", value, value))
+            self.position += 1
+        if frame_count < self.frame_samples:
+            chunks.extend(b"\x00" * ((self.frame_samples - frame_count) * 4))
+        return bytes(chunks)
+
+    def is_opus(self) -> bool:
+        return False
 
 
 class MusicControlView(discord.ui.View):
@@ -371,6 +548,11 @@ class MusicCog(commands.Cog):
     def get_state(self, guild_id: int) -> GuildMusicState:
         if guild_id not in self.states:
             self.states[guild_id] = GuildMusicState()
+            log.info(
+                "Created music state for guild %s with default volume=%s",
+                guild_id,
+                int(self.states[guild_id].volume * 100),
+            )
         return self.states[guild_id]
 
     def _register_import_task(self, guild_id: int, task: asyncio.Task[None]) -> None:
@@ -511,12 +693,20 @@ class MusicCog(commands.Cog):
 
     async def extract_track(self, query: str, requester: str) -> Track:
         loop = asyncio.get_running_loop()
+        log.info("Extracting track for query: %s", brief_value(query))
         info = await loop.run_in_executor(None, lambda: ytdl.extract_info(query, download=False))
 
         if "entries" in info and info["entries"]:
             info = info["entries"][0]
 
-        return Track(
+        raw_headers = info.get("http_headers")
+        http_headers = (
+            {str(key): str(value) for key, value in raw_headers.items()}
+            if isinstance(raw_headers, dict)
+            else None
+        )
+
+        track = Track(
             title=info.get("title", "Unknown Track"),
             stream_url=info["url"],
             webpage_url=info.get("webpage_url", query),
@@ -524,7 +714,15 @@ class MusicCog(commands.Cog):
             thumbnail=info.get("thumbnail"),
             requested_by=requester,
             source_query=query,
+            http_headers=http_headers,
         )
+        log.info(
+            "Extracted track: title=%s duration=%s headers=%s",
+            brief_value(track.title),
+            format_duration(track.duration),
+            "yes" if http_headers else "no",
+        )
+        return track
 
     async def ensure_voice(self, guild: discord.Guild, member: discord.Member) -> discord.VoiceClient:
         if not member.voice or not member.voice.channel:
@@ -535,14 +733,31 @@ class MusicCog(commands.Cog):
 
         if voice_client and voice_client.channel != target_channel:
             await voice_client.move_to(target_channel)
+            attach_voice_packet_counter(voice_client)
             return voice_client
 
         if voice_client:
+            attach_voice_packet_counter(voice_client)
             return voice_client
 
+        if guild.me and guild.me.voice and guild.me.voice.channel:
+            log.info(
+                "Clearing stale bot voice state before reconnect in guild %s: %s",
+                guild.id,
+                describe_member_voice_state(guild.me),
+            )
+            try:
+                await guild.change_voice_state(channel=None)
+                await asyncio.sleep(1.0)
+            except Exception as e:
+                log.warning("Failed to clear stale voice state in guild %s before reconnect: %s", guild.id, e)
+
         state = self.get_state(guild.id)
-        state.volume = 0.03
-        return await target_channel.connect()
+        log.info("Connecting to voice for guild %s with volume=%s", guild.id, int(state.volume * 100))
+        voice_client = await target_channel.connect()
+        attach_voice_packet_counter(voice_client)
+        log.info("Bot voice state after connect in guild %s: %s", guild.id, describe_member_voice_state(guild.me))
+        return voice_client
 
     def _spotify_kind_and_id(self, query: str) -> Optional[tuple[str, str]]:
         match = SPOTIFY_URL_RE.search(query)
@@ -1755,15 +1970,28 @@ class MusicCog(commands.Cog):
         error: Optional[Exception],
     ) -> None:
         if error:
-            log.error("Player error in guild %s for '%s': %s", guild.id, track.title, error)
+            log.error(
+                "Player error in guild %s for '%s': %s",
+                guild.id,
+                track.title,
+                error,
+                exc_info=(type(error), error, error.__traceback__),
+            )
             fallback_msg = await self._maybe_queue_preset_query_fallback(guild, track)
             if fallback_msg:
                 await self._send_channel_message(guild, fallback_msg)
             else:
                 await self._send_channel_message(
                     guild,
-                    f"Playback failed for `{track.title}`. The stream may be offline or geo-blocked.",
+                    f"Playback failed for `{track.title}`: `{brief_error_message(error)}`",
                 )
+        else:
+            log.info(
+                "Playback finished in guild %s for '%s' without player error. %s",
+                guild.id,
+                track.title,
+                voice_packet_stats(guild.voice_client),
+            )
 
         await self.play_next(guild)
 
@@ -2044,7 +2272,7 @@ class MusicCog(commands.Cog):
                 added_count += 1
             except Exception as e:
                 failed_count += 1
-                log.warning("Background load failed for '%s': %s", entry, e)
+                log.exception("Background load failed for '%s'", entry)
 
         guild = self.bot.get_guild(guild_id)
         if guild:
@@ -2079,18 +2307,45 @@ class MusicCog(commands.Cog):
 
             track = state.queue.popleft()
             state.current = track
+            ffmpeg_stderr = open_ffmpeg_stderr_log()
 
             def after_play(error: Optional[Exception]) -> None:
+                if ffmpeg_stderr:
+                    try:
+                        ffmpeg_stderr.close()
+                    except OSError:
+                        pass
                 asyncio.run_coroutine_threadsafe(self._handle_after_play(guild, track, error), self.bot.loop)
 
             try:
-                raw_source = discord.FFmpegPCMAudio(track.stream_url, **FFMPEG_OPTIONS)
+                ffmpeg_options = ffmpeg_options_for_track(track)
+                log.info(
+                    "Starting FFmpeg playback in guild %s: title=%s volume=%s headers=%s",
+                    guild.id,
+                    brief_value(track.title),
+                    int(state.volume * 100),
+                    "yes" if track.http_headers else "no",
+                )
+                raw_source = discord.FFmpegPCMAudio(track.stream_url, stderr=ffmpeg_stderr, **ffmpeg_options)
                 source = discord.PCMVolumeTransformer(raw_source, volume=state.volume)
                 voice_client.play(source, after=after_play)
+                log.info(
+                    "Discord voice_client.play returned for guild %s: playing=%s paused=%s connected=%s",
+                    guild.id,
+                    voice_client.is_playing(),
+                    voice_client.is_paused(),
+                    voice_client.is_connected(),
+                )
             except Exception as e:
+                if ffmpeg_stderr:
+                    try:
+                        ffmpeg_stderr.close()
+                    except OSError:
+                        pass
                 state.current = None
                 failed_track = track
                 startup_error = e
+                log.exception("Failed to start FFmpeg for guild %s track '%s'", guild.id, track.title)
 
         if failed_track and startup_error:
             log.warning("Failed to start playback in guild %s for '%s': %s", guild.id, failed_track.title, startup_error)
@@ -2255,6 +2510,12 @@ class MusicCog(commands.Cog):
                 vc.stop()
             await self.clear_voice_channel_status(guild)
             await vc.disconnect()
+        elif guild.me and guild.me.voice and guild.me.voice.channel:
+            log.info("Clearing stale voice state on stop for guild %s: %s", guild.id, describe_member_voice_state(guild.me))
+            try:
+                await guild.change_voice_state(channel=None)
+            except Exception as e:
+                log.warning("Failed to clear stale voice state on stop for guild %s: %s", guild.id, e)
         await self.delete_control_panel(guild)
         return True, "Stopped playback, cleared queue, and disconnected."
 
@@ -2267,6 +2528,13 @@ class MusicCog(commands.Cog):
         vc = guild.voice_client
         if vc and isinstance(vc.source, discord.PCMVolumeTransformer):
             vc.source.volume = state.volume
+        log.info(
+            "Volume set for guild %s: percent=%s connected=%s source_adjusted=%s",
+            guild.id,
+            clamped,
+            bool(vc),
+            bool(vc and isinstance(vc.source, discord.PCMVolumeTransformer)),
+        )
         return True, f"Volume set to `{clamped}%`."
 
     async def adjust_volume(self, guild: Optional[discord.Guild], delta_percent: int) -> tuple[bool, str]:
@@ -2299,11 +2567,27 @@ class MusicCog(commands.Cog):
             await ctx.send(f"Usage: `{self.prefix}play [--shuffle] <query or playlist link>`")
             return
 
+        log.info(
+            "Play command in guild %s by %s: query=%s",
+            ctx.guild.id,
+            getattr(ctx.author, "id", "unknown"),
+            brief_value(parsed_query),
+        )
+
         try:
             voice_client = await self.ensure_voice(ctx.guild, ctx.author)
         except RuntimeError as e:
             await ctx.send(str(e))
             return
+
+        log.info(
+            "Voice ready for guild %s: channel=%s connected=%s playing=%s paused=%s",
+            ctx.guild.id,
+            getattr(getattr(voice_client, "channel", None), "id", "unknown"),
+            voice_client.is_connected(),
+            voice_client.is_playing(),
+            voice_client.is_paused(),
+        )
 
         state = self.get_state(ctx.guild.id)
         state.channel_id = ctx.channel.id
@@ -2312,8 +2596,16 @@ class MusicCog(commands.Cog):
             try:
                 pending_queries, source_note = await self.resolve_queries(parsed_query)
             except RuntimeError as e:
+                log.warning("Play query resolution failed in guild %s: %s", ctx.guild.id, e)
                 await ctx.send(str(e))
                 return
+
+            log.info(
+                "Resolved play command in guild %s to %s pending query/query(s). source=%s",
+                ctx.guild.id,
+                len(pending_queries),
+                source_note or "direct",
+            )
 
             added: list[Track] = []
             failed_early: list[str] = []
@@ -2323,6 +2615,7 @@ class MusicCog(commands.Cog):
                 random.shuffle(ordered_queries)
 
             remaining_queries: list[str] = []
+            first_load_error: Optional[Exception] = None
             for entry in ordered_queries:
                 if len(added) >= preload_target:
                     remaining_queries.append(entry)
@@ -2333,14 +2626,27 @@ class MusicCog(commands.Cog):
                     added.append(track)
                 except Exception as e:
                     failed_early.append(entry)
-                    log.warning("Failed to preload entry '%s': %s", entry, e)
+                    if first_load_error is None:
+                        first_load_error = e
+                    log.exception("Failed to preload entry '%s'", entry)
 
             if failed_early:
                 remaining_queries = failed_early + remaining_queries
 
         if not added:
-            await ctx.send("I couldn't load anything from that request.")
+            if first_load_error:
+                await ctx.send(f"I couldn't load anything from that request: `{brief_error_message(first_load_error)}`")
+            else:
+                await ctx.send("I couldn't load anything from that request.")
             return
+
+        log.info(
+            "Queued %s track(s) immediately for guild %s; remaining=%s; first=%s",
+            len(added),
+            ctx.guild.id,
+            len(remaining_queries),
+            brief_value(added[0].title),
+        )
 
         if remaining_queries:
             task = asyncio.create_task(
@@ -2499,6 +2805,174 @@ class MusicCog(commands.Cog):
         if ok:
             await self.refresh_now_playing_embed(ctx.guild)
 
+    @commands.command(name="tone")
+    async def tone_cmd(self, ctx: commands.Context) -> None:
+        if not ctx.guild or not isinstance(ctx.author, discord.Member):
+            await ctx.send("This command works in a server only.")
+            return
+
+        try:
+            voice_client = await self.ensure_voice(ctx.guild, ctx.author)
+        except RuntimeError as e:
+            await ctx.send(str(e))
+            return
+
+        if voice_client.is_playing() or voice_client.is_paused():
+            voice_client.stop()
+
+        source = ToneAudioSource(frequency=440.0, duration=5.0, volume=1.0)
+
+        def after_tone(error: Optional[Exception]) -> None:
+            if error:
+                log.error(
+                    "Tone playback error in guild %s: %s",
+                    ctx.guild.id if ctx.guild else "unknown",
+                    error,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+            else:
+                log.info(
+                    "Tone playback finished in guild %s without player error. %s",
+                    ctx.guild.id if ctx.guild else "unknown",
+                    voice_packet_stats(ctx.guild.voice_client if ctx.guild else None),
+                )
+
+        log.info("Starting test tone in guild %s.", ctx.guild.id)
+        voice_client.play(source, after=after_tone)
+        log.info(
+            "Tone voice_client.play returned for guild %s: playing=%s connected=%s",
+            ctx.guild.id,
+            voice_client.is_playing(),
+            voice_client.is_connected(),
+        )
+        await ctx.send("Playing a 5-second test tone at 100%.")
+
+    @commands.command(name="opustone")
+    async def opustone_cmd(self, ctx: commands.Context) -> None:
+        if not ctx.guild or not isinstance(ctx.author, discord.Member):
+            await ctx.send("This command works in a server only.")
+            return
+
+        try:
+            voice_client = await self.ensure_voice(ctx.guild, ctx.author)
+        except RuntimeError as e:
+            await ctx.send(str(e))
+            return
+
+        if voice_client.is_playing() or voice_client.is_paused():
+            voice_client.stop()
+
+        ffmpeg_stderr = open_ffmpeg_stderr_log()
+
+        def after_opus_tone(error: Optional[Exception]) -> None:
+            if ffmpeg_stderr:
+                try:
+                    ffmpeg_stderr.close()
+                except OSError:
+                    pass
+            if error:
+                log.error(
+                    "Opus tone playback error in guild %s: %s",
+                    ctx.guild.id if ctx.guild else "unknown",
+                    error,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+            else:
+                log.info(
+                    "Opus tone playback finished in guild %s without player error. %s",
+                    ctx.guild.id if ctx.guild else "unknown",
+                    voice_packet_stats(ctx.guild.voice_client if ctx.guild else None),
+                )
+
+        log.info("Starting FFmpeg Opus test tone in guild %s.", ctx.guild.id)
+        try:
+            source = discord.FFmpegOpusAudio(
+                "sine=frequency=440:duration=5",
+                before_options="-f lavfi",
+                stderr=ffmpeg_stderr,
+            )
+            voice_client.play(source, after=after_opus_tone)
+        except Exception as e:
+            if ffmpeg_stderr:
+                try:
+                    ffmpeg_stderr.close()
+                except OSError:
+                    pass
+            log.exception("Failed to start FFmpeg Opus tone in guild %s", ctx.guild.id)
+            await ctx.send(f"Opus tone failed: `{brief_error_message(e)}`")
+            return
+
+        log.info(
+            "Opus tone voice_client.play returned for guild %s: playing=%s connected=%s",
+            ctx.guild.id,
+            voice_client.is_playing(),
+            voice_client.is_connected(),
+        )
+        await ctx.send("Playing a 5-second FFmpeg Opus test tone at 100%.")
+
+    @commands.command(name="voicedebug", aliases=["vdebug"])
+    async def voicedebug_cmd(self, ctx: commands.Context) -> None:
+        if not ctx.guild:
+            await ctx.send("This command works in a server only.")
+            return
+
+        vc = ctx.guild.voice_client
+        me = ctx.guild.me
+        channel = vc.channel if vc else (me.voice.channel if me and me.voice else None)
+        perms = channel.permissions_for(me) if channel and me else None
+        state = self.get_state(ctx.guild.id)
+        details = [
+            f"opus_loaded={discord.opus.is_loaded()}",
+            f"connected={bool(vc and vc.is_connected())}",
+            f"playing={bool(vc and vc.is_playing())}",
+            f"paused={bool(vc and vc.is_paused())}",
+            f"volume={int(state.volume * 100)}",
+            describe_member_voice_state(me),
+            f"endpoint={getattr(vc, 'endpoint', None) if vc else 'none'}",
+            f"mode={getattr(vc, 'mode', None) if vc else 'none'}",
+            voice_packet_stats(vc),
+        ]
+        if perms:
+            details.extend(
+                [
+                    f"perm_connect={perms.connect}",
+                    f"perm_speak={perms.speak}",
+                    f"perm_use_voice_activation={perms.use_voice_activation}",
+                ]
+            )
+        message = " | ".join(details)
+        log.info("Voice debug for guild %s: %s", ctx.guild.id, message)
+        await ctx.send(f"```text\n{message}\n```")
+
+    @commands.command(name="voicefix", aliases=["vfix"])
+    async def voicefix_cmd(self, ctx: commands.Context) -> None:
+        if not ctx.guild:
+            await ctx.send("This command works in a server only.")
+            return
+
+        vc = ctx.guild.voice_client
+        if vc:
+            if vc.is_playing() or vc.is_paused():
+                vc.stop()
+            try:
+                await vc.disconnect()
+            except Exception as e:
+                log.warning("Voice client disconnect failed during voicefix for guild %s: %s", ctx.guild.id, e)
+
+        try:
+            await ctx.guild.change_voice_state(channel=None)
+            await asyncio.sleep(1.0)
+        except Exception as e:
+            log.warning("Guild voice-state clear failed during voicefix for guild %s: %s", ctx.guild.id, e)
+            await ctx.send(f"Voice fix failed: `{brief_error_message(e)}`")
+            return
+
+        state = self.get_state(ctx.guild.id)
+        state.current = None
+        state.queue.clear()
+        log.info("Voice state cleared by voicefix for guild %s.", ctx.guild.id)
+        await ctx.send("Voice state cleared. Try `.tone` now.")
+
     @commands.command(name="spotifycheck")
     async def spotifycheck_cmd(self, ctx: commands.Context) -> None:
         if not await self.can_manage_spotify_auth(ctx):
@@ -2612,6 +3086,21 @@ class KithWaveBot(commands.Bot):
     async def on_ready(self) -> None:
         log.info("Logged in as %s (%s)", self.user, self.user.id if self.user else "unknown")
         log.info("Prefix commands enabled: %s", self.prefix)
+
+    async def on_command_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
+        if isinstance(error, commands.CommandNotFound):
+            return
+        original = getattr(error, "original", error)
+        log.exception(
+            "Unhandled command error for command=%s guild=%s",
+            getattr(ctx.command, "qualified_name", "unknown"),
+            getattr(ctx.guild, "id", "dm"),
+            exc_info=(type(original), original, original.__traceback__),
+        )
+        try:
+            await ctx.send(f"Command failed: `{brief_error_message(original)}`")
+        except discord.HTTPException:
+            pass
 
 
 def main() -> None:
